@@ -1,0 +1,131 @@
+import cv2, serial, threading, math
+from ultralytics import YOLO
+
+# --- CONFIGURATION ---
+SERIAL_PORT = 'COM13'
+BAUD_RATE = 115200
+MODEL_PATH = r'c:\Users\pfaiz\runs\detect\train-29\weights\best.pt'
+
+model = YOLO(MODEL_PATH)
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+
+# Cameras
+cap_orbbec = cv2.VideoCapture(1)
+cap_webcam = cv2.VideoCapture(0)
+active_cap = cap_orbbec  # Default start (used for weapon detection stage)
+
+# --- CUSTOM ID MAPPING ---
+# Maps your YOLO model index to your requested custom integer
+YOLO_TO_CUSTOM = {
+    6: 2,   # fist
+    13: 3,  # palm
+    15: 4,  # spear
+    4: 5,   # R2 Real
+    5: 6,   # R2 Real Blue
+    2: 7,   # R2 Fake
+    3: 8,   # R2 Fake Blue
+    7: 9,   # grid 1 empty
+    9: 10,  # grid 2 empty
+    11: 11, # grid 3 empty
+    8: 12,  # grid 1 occupy
+    10: 13, # grid 2 occupy
+    12: 14, # grid 3 occupy
+    0: 15,  # R1 (Assigned 15 to keep it out of 1-14)
+    1: 16   # R1 Blue (Assigned 16)
+}
+
+# User-selected weapon (Defaults to 2: Fist)
+active_weapon_ids = {2}  # changing this will change the weapon ID sent to the Arduino
+
+def input_thread():
+    global active_weapon_ids
+    while True:
+        try:
+            val = int(input())  # Type ID in Python terminal to switch weapon
+            active_weapon_ids = {val}
+        except: pass
+threading.Thread(target=input_thread, daemon=True).start()
+
+# --- MAIN LOOP ---
+while True:
+    if ser.in_waiting > 0:
+        commands = ser.readlines()
+        if not commands: continue
+
+        # Get the latest command
+        latest_cmd = commands[-1].decode('utf-8', errors='ignore').strip()
+
+        # CAMERA SWITCH LOGIC
+        # Arduino sends 'C' once the weapon (fist/palm/spear) is no longer detected.
+        # This switches detection from the Orbbec camera to the webcam (e.g. for the
+        # grid/Meihua stage).
+        if latest_cmd == '':
+            active_cap = cap_webcam
+            print("[CAMERA] Switched to webcam (weapon stage complete)")
+
+        # REQUEST DATA LOGIC
+        elif latest_cmd == '1':
+            ret, frame = active_cap.read()
+            if not ret: continue
+
+            results = model(frame, stream=True, verbose=False, conf=0.3)
+
+            target_obj = None
+            target_dist = float('inf')
+            penalty_obj = None
+
+            for r in results:
+                for box in r.boxes:
+                    yolo_cls = int(box.cls[0])
+                    custom_id = YOLO_TO_CUSTOM.get(yolo_cls, 1)  # Default to 1 (None)
+
+                    x1, y1, x2, y2 = [int(v) for v in box.xyxy[0]]
+                    cx, cy = x1+(x2-x1)//2, y1+(y2-y1)//2
+
+                    box_color = None
+                    is_locked = False
+
+                    # 1. WEAPONS (2, 3, 4) - BLUE BOX, LOCKED
+                    if custom_id in [2, 3, 4] and custom_id in active_weapon_ids:
+                        box_color = (255, 0, 0)  # Blue (BGR)
+                        is_locked = True
+
+                    # 2. R2 REAL (5, 6) - GREEN BOX, LOCKED
+                    elif custom_id in [5, 6]:
+                        box_color = (0, 255, 0)  # Green
+                        is_locked = True
+
+                    # 3. GRIDS EMPTY (9, 10, 11) - ORANGE BOX, LOCKED
+                    elif custom_id in [9, 10, 11]:
+                        box_color = (0, 165, 255)  # Orange
+                        is_locked = True
+
+                    # 4. PENALTY / CHANGE POS (7, 8, 15, 16) - RED BOX
+                    elif custom_id in [7, 8, 15, 16]:
+                        box_color = (0, 0, 255)  # Red
+                        penalty_obj = (custom_id, cx, cy)
+                        cv2.putText(frame, "CHANGE POS!", (x1, y2+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+
+                    # DRAWING
+                    if box_color:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                        label = f"LOCKED ID:{custom_id}" if is_locked else f"ID:{custom_id}"
+                        cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+                        # Set target if locked and closest
+                        if is_locked:
+                            dist = math.hypot(cx - 320, cy - 240)
+                            if dist < target_dist:
+                                target_dist, target_obj = dist, (custom_id, cx, cy)
+
+            # SEND DATA (Penalty overrides normal targets to ensure robot avoids them)
+            if penalty_obj:
+                ser.write(f"<{penalty_obj[0]},{penalty_obj[1]},{penalty_obj[2]}>\n".encode())
+            elif target_obj:
+                ser.write(f"<{target_obj[0]},{target_obj[1]},{target_obj[2]}>\n".encode())
+            else:
+                ser.write(b"<1,0,0>\n")  # 1 = None
+            ser.flush()
+
+    if cv2.waitKey(1) == ord('q'): break
+ser.close()
