@@ -4,7 +4,7 @@ from ultralytics import YOLO
 # --- CONFIGURATION ---
 SERIAL_PORT = 'COM13'
 BAUD_RATE = 115200
-MODEL_PATH = r'c:\Users\pfaiz\runs\detect\train-29\weights\best.pt'
+MODEL_PATH = r'best.pt'
 
 model = YOLO(MODEL_PATH)
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
